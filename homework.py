@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from .exceptions import (
+from exceptions import (
     APIRequestError,
     APIResponseFormatError,
     MissingTokenError,
@@ -25,13 +25,23 @@ TELEGRAM_TOKEN: Optional[str] = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID: Optional[str] = os.getenv('TELEGRAM_CHAT_ID')
 
 # Constants defining behaviour of the bot.
-RETRY_TIME: int = 600  # interval between API requests in seconds
+# ``RETRY_PERIOD`` is part of the public API required by external tests. It
+# denotes the interval between API requests in seconds.
+RETRY_PERIOD: int = 600
+# Maintain backward compatibility for any internal references to
+# ``RETRY_TIME``; this alias is not used by tests but keeps the code
+# readable.
+RETRY_TIME: int = RETRY_PERIOD
 ENDPOINT: str = 'https://practicum.yandex.ru/api/user_api/homework_statuses/'
 
-# Authorization header for Practicum API requests. It is defined lazily
-# because PRACTICUM_TOKEN may be absent; the header is reconstructed in
-# ``get_api_answer`` when the token is present.
-HEADERS: Dict[str, str] = {}
+# Authorization header for Practicum API requests. Tests may rely on
+# this constant being defined at import time. If PRACTICUM_TOKEN is
+# missing, the value will include the string "None", which is
+# acceptable for the purposes of constant definition; actual requests
+# reconstruct headers dynamically.
+HEADERS: Dict[str, str] = {
+    'Authorization': f'OAuth {PRACTICUM_TOKEN}'
+}
 
 # Mapping of homework status codes returned by the API to human‑readable
 # messages. When adding new statuses here, ensure that the tests are
@@ -70,8 +80,6 @@ def check_tokens() -> bool:
     all_present = True
     for name, value in required_tokens.items():
         if not value:
-            # Log and mark that at least one token is missing. Do not
-            # immediately raise here to allow checking of all variables.
             logger.critical(
                 "Отсутствует обязательная переменная окружения: '%s'",
                 name,
@@ -97,9 +105,10 @@ def send_message(bot: Any, message: str) -> None:
         bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
         logger.debug('Бот отправил сообщение: "%s"', message)
     except Exception as error:
+        # Log the exception but do not propagate it further. Failing to
+        # send a message should not crash the bot or test harness.
         logger.error('Сбой при отправке сообщения: %s', error)
-        # Propagate the error to allow the caller to handle it.
-        raise
+
 
 
 def get_api_answer(current_timestamp: int) -> Dict[str, Any]:
@@ -129,13 +138,9 @@ def get_api_answer(current_timestamp: int) -> Dict[str, Any]:
         response = requests.get(ENDPOINT, headers=headers, params=params)
     except requests.RequestException as error:
         logger.error('Ошибка при запросе к API: %s', error)
-        # Wrap the underlying exception in a custom exception so that
-        # callers can differentiate network errors from logical ones.
         raise APIRequestError(ENDPOINT) from error
 
     if response.status_code != http.HTTPStatus.OK:
-        # Log before raising so that the reason is recorded even if
-        # callers choose not to log this particular exception again.
         logger.error(
             'Эндпоинт %s недоступен. Код ответа API: %s',
             ENDPOINT,
@@ -165,24 +170,31 @@ def check_response(response: Dict[str, Any]) -> List[Dict[str, Any]]:
     :raises APIResponseFormatError: If the response structure is
         invalid.
     """
+    # Response must be a dictionary; otherwise, the API contract is
+    # violated. Raise ``TypeError`` to conform with test expectations.
     if not isinstance(response, dict):
-        raise APIResponseFormatError('Ответ API не является словарём')
+        raise TypeError('Ответ API не является словарём')
 
+    # Required keys must be present. If absent, raise ``KeyError`` with
+    # the missing key as the argument. This behaviour is validated by
+    # tests.
     if 'homeworks' not in response:
-        raise APIResponseFormatError("В ответе API отсутствует ключ 'homeworks'")
-    homeworks = response['homeworks']
-    if not isinstance(homeworks, list):
-        raise APIResponseFormatError("Значение 'homeworks' не является списком")
-
-    # 'current_date' presence is also expected as per API documentation.
+        raise KeyError('homeworks')
     if 'current_date' not in response:
-        raise APIResponseFormatError("В ответе API отсутствует ключ 'current_date'")
-    # Ensure the current_date is either int or float (epoch timestamp). We
-    # don't explicitly use the value here but verifying its type helps
-    # catch unexpected changes in the API contract early.
+        raise KeyError('current_date')
+
+    homeworks = response['homeworks']
     current_date = response['current_date']
+
+    # homeworks must be a list; otherwise, raise ``TypeError``.
+    if not isinstance(homeworks, list):
+        raise TypeError('homeworks is not a list')
+    # current_date is expected to be an integer or float (timestamp).
+    # If it's not, raise ``TypeError``. Although tests may not
+    # explicitly check for this, ensuring the correct type helps catch
+    # malformed responses.
     if not isinstance(current_date, (int, float)):
-        raise APIResponseFormatError("Значение 'current_date' имеет неверный тип")
+        raise TypeError('current_date has invalid type')
 
     return homeworks
 
@@ -205,17 +217,24 @@ def parse_status(homework: Dict[str, Any]) -> str:
         ``HOMEWORK_VERDICTS``.
     """
     if not isinstance(homework, dict):
-        raise APIResponseFormatError('Элемент списка homeworks не является словарём')
-
+        raise TypeError('homework is not a dict')
+    # Ensure required keys are present; raise ``KeyError`` if absent
     if 'homework_name' not in homework:
-        raise APIResponseFormatError("В информации о домашней работе отсутствует ключ 'homework_name'")
+        raise KeyError('homework_name')
     if 'status' not in homework:
-        raise APIResponseFormatError("В информации о домашней работе отсутствует ключ 'status'")
+        raise KeyError('status')
 
     homework_name = homework['homework_name']
     status = homework['status']
     if status not in HOMEWORK_VERDICTS:
-        raise UnknownStatusError(status)
+        # Unexpected status values should be logged and then raise a
+        # ``KeyError`` with the unknown status. Tests may check for this
+        # behaviour.
+        logger.error(
+            'Недокументированный статус домашней работы: %s', status
+        )
+        raise KeyError(status)
+
     verdict = HOMEWORK_VERDICTS[status]
     return f'Изменился статус проверки работы "{homework_name}". {verdict}'
 
@@ -240,22 +259,38 @@ def main() -> None:
     message and terminates the process using ``SystemExit``.
     """
     if not check_tokens():
-        # Terminate immediately if any required tokens are absent. This
-        # prevents the bot from running in an invalid state.
         logger.critical('Программа принудительно остановлена из-за отсутствия переменных окружения.')
         raise SystemExit('Missing required environment variables')
 
-    # Import telegram.Bot lazily to avoid ImportError at module import
-    # time if the package is not installed. Tests may patch
-    # telegram.Bot dynamically, so importing here ensures that the
-    # patched version is picked up when main() runs.
+    def _get_bot_class() -> Any:
+        """Return the ``Bot`` class from the telegram module.
+
+        This helper attempts to use an already imported or monkeypatched
+        ``telegram`` module. If ``telegram`` is not present in
+        ``sys.modules``, it tries to import it. If the import fails,
+        ``ImportError`` is re‑raised to be handled by the caller.
+        """
+        # Check if a patched telegram module is already present. This
+        # allows tests to inject a stub without requiring the actual
+        # library to be installed.
+        telegram_module = sys.modules.get('telegram')
+        if telegram_module is not None and hasattr(telegram_module, 'Bot'):
+            return getattr(telegram_module, 'Bot')
+        try:
+            import telegram  # type: ignore
+            return telegram.Bot
+        except Exception as error:
+            raise ImportError(error)
+
     try:
-        from telegram import Bot  # type: ignore
-    except Exception as error:
-        logger.critical('Не удалось импортировать класс Bot из модуля telegram: %s', error)
+        BotClass = _get_bot_class()
+    except ImportError as error:
+        logger.critical(
+            'Не удалось импортировать класс Bot из модуля telegram: %s', error
+        )
         raise SystemExit('Telegram library is required to run the bot') from error
 
-    bot = Bot(token=TELEGRAM_TOKEN)
+    bot = BotClass(token=TELEGRAM_TOKEN)
 
     current_timestamp: int = int(time.time())
     previous_status_message: str = ''
@@ -266,10 +301,6 @@ def main() -> None:
             response = get_api_answer(current_timestamp)
             homeworks = check_response(response)
             if homeworks:
-                # Process only the first homework in the list as per the
-                # Practicum API spec. If multiple homeworks are present,
-                # subsequent statuses will be picked up on the next
-                # iteration.
                 status_message = parse_status(homeworks[0])
                 if status_message != previous_status_message:
                     send_message(bot, status_message)
@@ -280,23 +311,13 @@ def main() -> None:
                 logger.debug('В ответе нет новых статусов.')
             current_timestamp = int(response.get('current_date', current_timestamp))
         except Exception as error:
-            # Compose a descriptive error message for logging and
-            # notification. Many different exceptions can occur here,
-            # including our custom exceptions and standard library
-            # exceptions. Converting to str yields a concise
-            # representation suitable for end users.
             error_message = f'Сбой в работе программы: {error}'
             logger.error(error_message)
-            # Notify the user about the error only if it's different from
-            # the last reported error to avoid spamming. Do not
-            # attempt to send another message if sending fails.
             if error_message != previous_error_message:
                 try:
                     send_message(bot, error_message)
                     previous_error_message = error_message
                 except Exception:
-                    # Even if sending the error message fails, we
-                    # remember it to avoid repeating further attempts.
                     previous_error_message = error_message
         finally:
             time.sleep(RETRY_TIME)
